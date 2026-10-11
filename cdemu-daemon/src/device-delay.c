@@ -24,10 +24,105 @@
 
 
 /**********************************************************************\
+ *                   Slow sector emulation (local patch)              *
+\**********************************************************************/
+/* Weak sectors (e.g. SafeDisc) make a real drive retry for a long time
+ * before it returns data, and the next sector costs a re-seek. Protections
+ * time this. The table comes from the file named by CDEMU_SLOW_SECTORS,
+ * one "lba delay_us" pair per line; it applies to every device. */
+#define SLOW_SECTOR_FOLLOWER_DELAY (45*1000)
+
+static GHashTable *slow_sectors = NULL;
+
+static void slow_sectors_load (void)
+{
+    static gboolean tried = FALSE;
+    if (tried) {
+        return;
+    }
+    tried = TRUE;
+
+    const gchar *path = g_getenv("CDEMU_SLOW_SECTORS");
+    if (!path) {
+        return;
+    }
+
+    gchar *contents = NULL;
+    if (!g_file_get_contents(path, &contents, NULL, NULL)) {
+        g_warning("Slow sectors: failed to read %s", path);
+        return;
+    }
+
+    slow_sectors = g_hash_table_new(g_direct_hash, g_direct_equal);
+    gchar **lines = g_strsplit(contents, "\n", -1);
+    for (gchar **line = lines; *line; line++) {
+        gint lba, delay;
+        if (sscanf(*line, "%d %d", &lba, &delay) == 2 && delay > 0) {
+            g_hash_table_insert(slow_sectors, GINT_TO_POINTER(lba), GINT_TO_POINTER(delay));
+        }
+    }
+    g_strfreev(lines);
+    g_free(contents);
+
+    g_message("Slow sectors: loaded %u entries from %s", g_hash_table_size(slow_sectors), path);
+}
+
+/* Optional plain drive timing, so reads don't complete in microseconds:
+ * CDEMU_SEEK_US for a jump of more than CDEMU_SEEK_MIN sectors away from
+ * where the last read ended, CDEMU_SECTOR_US per sector read. */
+static gint env_int (const gchar *name, gint fallback)
+{
+    const gchar *v = g_getenv(name);
+    return v ? atoi(v) : fallback;
+}
+
+static void cdemu_device_delay_slow_sectors (CdemuDevice *self, gint address, gint num_sectors)
+{
+    static gint last_slow_address = G_MININT;
+    static gint last_end = G_MININT;
+
+    slow_sectors_load();
+
+    gint seek_us = env_int("CDEMU_SEEK_US", 0);
+    gint seek_ns_per_sector = env_int("CDEMU_SEEK_NS_PER_SECTOR", 0);
+    gint seek_min = env_int("CDEMU_SEEK_MIN", 16);
+    gint sector_us = env_int("CDEMU_SECTOR_US", 0);
+
+    if (num_sectors > 0) {
+        gint distance = last_end == G_MININT ? 0 : abs(address - last_end);
+        if (seek_us && distance > seek_min) {
+            /* base cost plus a part growing with the seek distance */
+            self->priv->delay_amount += seek_us + (gint64)distance * seek_ns_per_sector / 1000;
+        }
+        self->priv->delay_amount += (gint64)sector_us * num_sectors;
+        last_end = address + num_sectors;
+    }
+
+    if (!slow_sectors) {
+        return;
+    }
+
+    for (gint a = address; a < address + num_sectors; a++) {
+        gint delay = GPOINTER_TO_INT(g_hash_table_lookup(slow_sectors, GINT_TO_POINTER(a)));
+        if (delay) {
+            self->priv->delay_amount += delay;
+            last_slow_address = a;
+            CDEMU_DEBUG(self, DAEMON_DEBUG_DELAY, "%s: slow sector 0x%X: +%d us", __debug__, a, delay);
+        } else if (a == last_slow_address + 1) {
+            self->priv->delay_amount += SLOW_SECTOR_FOLLOWER_DELAY;
+            last_slow_address = G_MININT;
+        }
+    }
+}
+
+
+/**********************************************************************\
  *                      Delay calculation                             *
 \**********************************************************************/
 static void cdemu_device_delay_increase (CdemuDevice *self, gint address, gint num_sectors)
 {
+    cdemu_device_delay_slow_sectors(self, address, num_sectors);
+
     gdouble rps = 12000.0 / 60; /* Rotations per second; fixed at 12000 RPMs for now */
     gdouble dpm_angle = 0;
     gdouble dpm_density = 0;
