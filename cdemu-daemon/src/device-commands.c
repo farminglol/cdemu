@@ -671,9 +671,38 @@ static gboolean command_inquiry_vpd (CdemuDevice *self, const struct INQUIRY_CDB
     return TRUE;
 }
 
+/* Local patch: serve a captured response from a real drive verbatim, if
+ * $CDEMU_OVERRIDE_DIR/<name> exists. Returns TRUE if the buffer was filled. */
+static gboolean response_override (CdemuDevice *self, const gchar *name)
+{
+    const gchar *dir = g_getenv("CDEMU_OVERRIDE_DIR");
+    if (!dir) {
+        return FALSE;
+    }
+
+    gchar *path = g_build_filename(dir, name, NULL);
+    gchar *contents = NULL;
+    gsize len = 0;
+    gboolean ok = g_file_get_contents(path, &contents, &len, NULL) && len > 0 && len <= 4096;
+    g_free(path);
+
+    if (ok) {
+        memcpy(self->priv->buffer, contents, len);
+        self->priv->buffer_size = len;
+        CDEMU_DEBUG(self, DAEMON_DEBUG_MMC, "%s: serving override response %s (%" G_GSIZE_FORMAT " bytes)", __debug__, name, len);
+    }
+    g_free(contents);
+    return ok;
+}
+
 static gboolean command_inquiry (CdemuDevice *self, const guint8 *raw_cdb)
 {
     struct INQUIRY_CDB *cdb = (struct INQUIRY_CDB *)raw_cdb;
+
+    if (!cdb->evpd && !cdb->page_code && response_override(self, "inquiry.bin")) {
+        cdemu_device_write_buffer(self, GUINT16_FROM_BE(cdb->length));
+        return TRUE;
+    }
 
     struct INQUIRY_Data *ret_data = (struct INQUIRY_Data *)self->priv->buffer;
     self->priv->buffer_size = sizeof(struct INQUIRY_Data);
@@ -814,6 +843,12 @@ static gboolean command_mode_sense (CdemuDevice *self, const guint8 *raw_cdb)
         transfer_len = GUINT16_FROM_BE(cdb->length);
 
         self->priv->buffer_size = sizeof(struct MODE_SENSE_10_Header);
+    }
+
+    if (raw_cdb[0] == MODE_SENSE_10 && page_code == 0x2A && pc == 0x00
+        && response_override(self, "modesense10-2a.bin")) {
+        cdemu_device_write_buffer(self, transfer_len);
+        return TRUE;
     }
 
     guint8 *ret_data = self->priv->buffer+self->priv->buffer_size;
@@ -2756,6 +2791,40 @@ gint cdemu_device_execute_command (CdemuDevice *self, const guint8 *cdb)
     CDEMU_DEBUG(self, DAEMON_DEBUG_MMC, "%s: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X", __debug__,
         cdb[0], cdb[1], cdb[2], cdb[3], cdb[4], cdb[5],
         cdb[6], cdb[7], cdb[8], cdb[9], cdb[10], cdb[11]);
+
+    /* Local patch: per-CDB overrides captured from a real drive.
+     * $CDEMU_OVERRIDE_DIR/cdb-<hex>.bin is returned as data (GOOD status);
+     * cdb-<hex>.sense holds "key asc ascq" (hex) and is returned as an error. */
+    if (g_getenv("CDEMU_OVERRIDE_DIR")) {
+        gint cdb_len = cdb[0] < 0x20 ? 6 : (cdb[0] < 0x60 ? 10 : 12);
+        gchar hex[2*12 + 1];
+        for (gint i = 0; i < cdb_len; i++) {
+            g_snprintf(hex + 2*i, 3, "%02x", cdb[i]);
+        }
+
+        gchar *name = g_strdup_printf("cdb-%s.bin", hex);
+        gboolean have_data = response_override(self, name);
+        g_free(name);
+        if (have_data) {
+            cdemu_device_write_buffer(self, self->priv->buffer_size);
+            return GOOD;
+        }
+
+        gchar *path = g_strdup_printf("%s/cdb-%s.sense", g_getenv("CDEMU_OVERRIDE_DIR"), hex);
+        gchar *contents = NULL;
+        if (g_file_get_contents(path, &contents, NULL, NULL)) {
+            guint key = 0, asc = 0, ascq = 0;
+            if (sscanf(contents, "%x %x %x", &key, &asc, &ascq) == 3) {
+                CDEMU_DEBUG(self, DAEMON_DEBUG_MMC, "%s: override sense %X/%02X/%02X for %s", __debug__, key, asc, ascq, hex);
+                cdemu_device_write_sense(self, key, (asc << 8) | ascq);
+                g_free(contents);
+                g_free(path);
+                return CHECK_CONDITION;
+            }
+        }
+        g_free(contents);
+        g_free(path);
+    }
 
     /* Packet command table */
     static const struct {
