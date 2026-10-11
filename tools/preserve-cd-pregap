@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Capture a CD pregap and package a single MODE1/2352 track as DAO NRG.
+
+Only handles one data track whose INDEX 01 is LBA 0. No disc contents are
+generated or repaired. Requires sg_raw for capture; packing is offline.
+"""
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import struct
+import subprocess
+import tempfile
+import time
+
+SECTOR = 2352
+PREGAP_SECTORS = 150
+PREGAP_BYTES = PREGAP_SECTORS * SECTOR
+
+
+def capture_once(device):
+    """Use transfers below 64 KiB, including on USB optical bridges."""
+    data = bytearray()
+    for start in range(0, PREGAP_SECTORS, 16):
+        end = min(start + 16, PREGAP_SECTORS)
+
+        def msf(frame):
+            return (frame // 4500, frame // 75 % 60, frame % 75)
+
+        cdb = (0xB9, 0, 0, *msf(start), *msf(end), 0xF8, 0, 0)
+        length = (end - start) * SECTOR
+        command = ["sg_raw", "--readonly", "--timeout=30", "--request", str(length), "--binary",
+                   str(device), *(f"{byte:02x}" for byte in cdb)]
+        deadline = time.monotonic() + 30
+        while True:
+            result = subprocess.run(command, capture_output=True)
+            # A just-closed tray may still be spinning up (NOT READY), or
+            # report a media-change UNIT ATTENTION. Retry only the first read.
+            if start == 0 and result.returncode in (2, 6) and time.monotonic() < deadline:
+                time.sleep(1)
+                continue
+            result.check_returncode()
+            break
+        if len(result.stdout) != length:
+            raise ValueError(f"Short read at LBA {start - 150}: expected {length}, got {len(result.stdout)}")
+        data.extend(result.stdout)
+    return bytes(data)
+
+
+def trailer(data_bytes):
+    """DAOX stores a file-backed pregap; CUEX keeps INDEX 01 at LBA 0."""
+    sectors = data_bytes // SECTOR - PREGAP_SECTORS
+
+    def chunk(tag, payload):
+        return tag + struct.pack(">I", len(payload)) + payload
+
+    cue = b"".join(struct.pack(">BBBBi", 0x41, track, index, 0, lba)
+                   for track, index, lba in ((0, 0, -150), (1, 0, -150), (1, 1, 0), (0xAA, 1, sectors)))
+    dao_header = struct.pack(">I", 64) + bytes(14) + bytes((0, 1, 1, 1))
+    dao_track = bytes(12) + struct.pack(">HBBHQQQ", SECTOR, 5, 0, 0, 0, PREGAP_BYTES, data_bytes)
+    return (chunk(b"CUEX", cue) + chunk(b"DAOX", dao_header + dao_track)
+            + chunk(b"SINF", struct.pack(">I", 1)) + chunk(b"MTYP", struct.pack(">I", 0x400))
+            + chunk(b"END!", b"") + b"NER5" + struct.pack(">Q", data_bytes))
+
+
+def publish_new(temporary, output):
+    # A hard link publishes only a fully written file and refuses an existing
+    # destination, including a dangling symlink. Both paths share a directory.
+    os.link(temporary, output)
+
+
+def capture(args):
+    first = capture_once(args.device)
+    second = capture_once(args.device)
+    if first != second:
+        raise ValueError("Pregap reads differ; no capture was saved")
+    with args.output.open("xb") as target:
+        target.write(first)
+    print(f"Verified two reads: {hashlib.sha256(first).hexdigest()}  {args.output}")
+
+
+def pack(args):
+    pregap = args.pregap.read_bytes()
+    if len(pregap) != PREGAP_BYTES:
+        raise ValueError(f"Pregap must contain exactly {PREGAP_BYTES} bytes")
+    size = args.bin.stat().st_size
+    if size < 17 * SECTOR or size % SECTOR or size // SECTOR > 0x7FFFFFFF:
+        raise ValueError("BIN must be a whole number of raw sectors containing one MODE1 data track")
+    with args.bin.open("rb") as source:
+        header = source.read(16)
+        source.seek(16 * SECTOR + 16)
+        pvd = source.read(7)
+        if header != bytes.fromhex("00ffffffffffffffffffff0000020001") or pvd != b"\x01CD001\x01":
+            raise ValueError("Expected a MODE1/2352 ISO9660 track starting at LBA 0, without a stored pregap")
+        source.seek(0)
+        digest = hashlib.sha256()
+        with tempfile.NamedTemporaryFile(dir=args.output.parent, prefix=".pregap-", delete=False) as target:
+            temporary = Path(target.name)
+            try:
+                target.write(pregap)
+                remaining = size
+                while remaining:
+                    block = source.read(min(8 * 1024 * 1024, remaining))
+                    if not block:
+                        raise ValueError("Input BIN changed or became unreadable during copy")
+                    target.write(block)
+                    digest.update(block)
+                    remaining -= len(block)
+                if source.read(1):
+                    raise ValueError("Input BIN grew during copy")
+                target.write(trailer(PREGAP_BYTES + size))
+                target.flush()
+                os.fsync(target.fileno())
+                publish_new(temporary, args.output)
+            finally:
+                temporary.unlink(missing_ok=True)
+    print(f"Preserved {size // SECTOR} data sectors and 150 pregap sectors: {args.output}")
+    print(f"Original data SHA-256: {digest.hexdigest()}")
+    print(f"Pregap SHA-256: {hashlib.sha256(pregap).hexdigest()}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    read = commands.add_parser("capture", help="Read and verify the original disc's first 150 pregap sectors")
+    read.add_argument("--device", type=Path, required=True)
+    read.add_argument("--output", type=Path, required=True)
+    read.set_defaults(action=capture)
+    build = commands.add_parser("pack", help="Package an existing raw track and captured pregap in NRG format")
+    build.add_argument("--bin", type=Path, required=True)
+    build.add_argument("--pregap", type=Path, required=True)
+    build.add_argument("--output", type=Path, required=True)
+    build.set_defaults(action=pack)
+    args = parser.parse_args()
+    if args.output.exists() or args.output.is_symlink():
+        parser.error("Output already exists; choose a new filename")
+    try:
+        args.action(args)
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        if isinstance(exc, subprocess.CalledProcessError):
+            parser.exit(1, exc.stderr.decode(errors="replace"))
+        parser.exit(1, f"{exc}\n")
+
+
+if __name__ == "__main__":
+    main()

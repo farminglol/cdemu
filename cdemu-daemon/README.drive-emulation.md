@@ -6,6 +6,10 @@ They were written to study how disc-check copy protections (SafeDisc 4) tell a
 virtual drive from a real one. Everything is off unless the environment
 variables below are set when the daemon starts.
 
+The Sims Complete Collection investigation is now resolved: the original image
+omitted data in the first track's pregap. A pregap-preserving NRG works with stock
+CDEmu, without these overrides. See [the findings and recovery tool](README.sims-pregap.md).
+
 ## Read timing
 
 | Variable | Meaning |
